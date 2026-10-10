@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+domain_cache.json
+.workbuddy/
+_venv/
+_push.py
