@@ -83,10 +83,18 @@ gld:sess=xxxxxx; gld:sess.sig=yyyyyy
 
 - **签到提示「鉴权失败 / 没有权限」**：Cookie 失效或复制不完整，重新登录获取最新 Cookie 并更新 Secrets。
 - **日志中邮箱/Cookie 不完整**：隐私保护自动脱敏。
+- **日志时间和收到通知的时间差 8 小时？**：GitHub runner 默认 UTC。v1.1.0 起已强制 `TZ=Asia/Shanghai`，日志为北京时间；旧版日志是同一时刻的 UTC 显示（并非跑错时间）。
 - **Actions 被暂停**：内置每月 1 号空提交保活；如仍被暂停，手动触发一次 workflow_dispatch。
 - **Cookie 有有效期吗**：有，会随会话过期，需重新获取。
 
 ## 📝 更新日志
+
+### v1.1.0 — 2026-10-12
+- **域名顺序调整**：候选域名中 `railgun.info` 提前为**第一个**尝试
+- **推送排版重构**：改为**每个账号独立分块、逐行展示**，修复手机上长行换行、内容挤成一团的问题
+- **PushPlus 换行修复**：`html` 模板下 `\n` 不换行，现自动转为 `<br>`
+- **时区修复**：日志统一为**北京时间**（`TZ=Asia/Shanghai`），不再显示 UTC 而导致与通知时间相差 8 小时
+- **定时修正**：修正 `cron` 叠加 `timezone` 造成的偏差，恢复为**北京时间 09:18 与 12:18** 各签一次
 
 ### v1.0.0 — 2026-10-10
 - **首版发布**：整合 [Devilstore/Glados-Railgun-checkin](https://github.com/Devilstore/Glados-Railgun-checkin) 与 [MZRidaz/GLaDOS-Auto-Checkin](https://github.com/MZRidaz/GLaDOS-Auto-Checkin) 两者优点
