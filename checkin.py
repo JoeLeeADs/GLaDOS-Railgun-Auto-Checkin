@@ -28,6 +28,18 @@ from typing import Any, Dict, List, Optional, Tuple, Callable
 
 import requests
 
+# ---- 统一时区为北京时间 ----
+# GitHub Actions runner 默认 UTC；若不设置，日志时间会与「实际收到通知的北京时间」差 8 小时，
+# 看起来像"跑错时间"。此处强制 TZ=Asia/Shanghai，使日志时间与通知时间一致。
+os.environ.setdefault("TZ", "Asia/Shanghai")
+if hasattr(time, "tzset"):
+    try:
+        time.tzset()
+    except Exception:
+        pass
+
+VERSION = "v1.1.0"
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -50,8 +62,8 @@ COOKIE_MIN_LENGTH = 24     # Cookie 低于此长度整体脱敏
 
 # 候选域名（自适应探测；可用 DOMAINS 环境变量覆盖，逗号分隔）
 DEFAULT_DOMAINS = [
-    "glados.cloud", "glados.space", "glados.one",
-    "railgun.info", "railgun.space",
+    "railgun.info", "glados.cloud", "glados.space",
+    "glados.one", "railgun.space",
 ]
 
 # 各平台合法 User-Agent（仅平台 token 关键，版本号无关）
@@ -299,10 +311,13 @@ def push_telegram(bot_token: str, chat_id: str, title: str, content: str) -> boo
 def push_pushplus(token: str, title: str, content: str) -> bool:
     if not token:
         return False
+    # PushPlus 用 html 模板时 \n 不会换行，必须转成 <br>，否则手机上所有内容挤成一行
+    html = (content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace("\n", "<br>"))
     return _push_request(
         "PushPlus",
         "https://www.pushplus.plus/send",
-        json_payload={"token": token, "title": title, "content": content, "template": "html"},
+        json_payload={"token": token, "title": title, "content": html, "template": "html"},
         success_check=lambda resp, r: r.ok and resp.get("code") == 200,
         fail_msg_keys=("msg",),
     )
@@ -619,29 +634,39 @@ def main() -> int:
         push_all("GLaDOS 签到", "❌ 未检测到 COOKIES / GLADOS_COOKIES，请配置 GitHub Secrets")
         return 1
 
-    logger.info("检测到 %d 个账号，候选域名: %s", len(cookies), ", ".join(domains))
+    logger.info("%s 检测到 %d 个账号，候选域名: %s", VERSION, len(cookies), ", ".join(domains))
     client = CheckinClient(domains, exchange_plan)
     ok = fail = repeat = 0
-    lines: List[str] = []
+    results: List[Dict[str, Any]] = []
 
     for idx, cookie in enumerate(cookies, 1):
         acc = client.run_account(cookie, idx)
+        results.append(acc)
         if acc["result"] == "ok":
             ok += 1
         elif acc["result"] == "repeat":
             repeat += 1
         else:
             fail += 1
-
-        line = f"{acc['index']}. {acc['email']} [{acc['domain']}] | {acc['status']} | 总积分:{acc['total_points']} | 剩余:{acc['remaining_days']}"
-        if acc.get("exchange") and acc["exchange"] != "-":
-            line += f" | 兑换:{acc['exchange']}"
-        lines.append(line)
-
         if idx < len(cookies):
             time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
 
-    title = f"签到完成 ✅{ok} ❌{fail} 🔄{repeat}"
+    # 组装「手机友好」排版：每个账号独立成块、逐行展示，避免长行在窄屏上换行挤成一团
+    sep = "─" * 16
+    lines: List[str] = [
+        f"🕘 {time.strftime('%Y-%m-%d %H:%M')}",
+        f"✅ 成功 {ok} · 🔄 已签到 {repeat} · ❌ 失败 {fail}",
+    ]
+    for acc in results:
+        lines.append(sep)
+        lines.append(f"{acc['index']}. {acc['email']}")
+        lines.append(f"   {acc['status']} · 剩余 {acc['remaining_days']} · 总计 {acc['total_points']}")
+        tail = f"   🌐 {acc['domain']}"
+        if acc.get("exchange") and acc["exchange"] != "-":
+            tail += f" · {acc['exchange']}"
+        lines.append(tail)
+
+    title = f"📋 签到完成 ✅{ok} 🔄{repeat} ❌{fail}"
     content = "\n".join(lines)
     if len(content) > CONTENT_MAX_LENGTH:
         content = content[:CONTENT_MAX_LENGTH] + "\n…(已截断)"
