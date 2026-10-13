@@ -38,7 +38,7 @@ if hasattr(time, "tzset"):
     except Exception:
         pass
 
-VERSION = "v1.1.0"
+VERSION = "v1.2.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -150,14 +150,29 @@ def _escape_markdown(text: str) -> str:
     return text
 
 
-def parse_earned_points(message: str) -> int:
-    """从签到成功响应文本解析本次获得积分数（GLaDOS 不返回 points 字段）。"""
-    if not message:
+def parse_earned_points(raw: Any) -> int:
+    """解析本次签到获得的积分（来源按可靠性排序，适配 GLaDOS 不同版本的返回结构）。
+
+    1) 响应字段：顶层 ``points`` / ``data.points``（Devilstore 版实现即依赖此字段）
+    2) 响应文案：英文 "got N points" / 中文 "获得 N 点"（MZRidaz 版实现依赖此文案）
+
+    注意：**不区分「签到成功 / 已签到」** —— GLaDOS 在「已签到」时同样会在响应里
+    带上今日已获得的积分（如「已经签到成功，获得 1 点」），这里一并解析出来。
+    """
+    if not isinstance(raw, dict):
         return 0
-    m = re.search(r"got\s+(\d+)\s+points?", message, re.IGNORECASE)
+    data = raw.get("data") if isinstance(raw.get("data"), dict) else {}
+    for val in (raw.get("points"), data.get("points")):
+        try:
+            if val is not None and str(val).strip() != "":
+                return int(float(val))
+        except (TypeError, ValueError):
+            continue
+    msg = str(raw.get("message") or "")
+    m = re.search(r"got\s+(\d+)\s+points?", msg, re.IGNORECASE)
     if m:
         return int(m.group(1))
-    m = re.search(r"获得\s*(\d+)\s*点", message)
+    m = re.search(r"获得\s*(\d+)\s*点", msg)
     return int(m.group(1)) if m else 0
 
 
@@ -224,7 +239,7 @@ def classify_checkin(code: Any, message: str) -> str:
     if code == 1:
         return "repeat"
     msg = (message or "").lower()
-    if re.search(r"got\s+\d+\s+points?", msg):
+    if re.search(r"got\s+\d+\s+points?", msg) or re.search(r"获得\s*\d+\s*点", message or ""):
         return "ok"
     if any(kw in msg for kw in REPEAT_KEYWORDS):
         return "repeat"
@@ -527,6 +542,7 @@ class CheckinClient:
         result = {
             "index": index, "email": "unknown", "domain": "-",
             "status": "", "result": "fail",
+            "earned": None,
             "total_points": "-", "remaining_days": "-", "exchange": "-",
         }
 
@@ -548,10 +564,14 @@ class CheckinClient:
         raw = self._do_checkin(domain, cookie)
         code = raw.get("code", -2)
         message = raw.get("message", "")
-        earned = parse_earned_points(message)
+        earned = parse_earned_points(raw)
         cls = classify_checkin(code, message)
+        result["earned"] = earned
+        # 记录签到原始响应：便于排查「积分未显示 / 接口文案变动」类问题（message 无隐私字段）
+        logger.info("账号 %d 签到响应: code=%s, points=%s, message=%s",
+                    index, code, raw.get("points"), message)
         if cls == "ok":
-            result["status"] = f"✅ 成功(+{earned}积分)"
+            result["status"] = "✅ 成功"
             result["result"] = "ok"
         elif cls == "repeat":
             result["status"] = "🔄 已签到"
@@ -660,7 +680,11 @@ def main() -> int:
     for acc in results:
         lines.append(sep)
         lines.append(f"{acc['index']}. {acc['email']}")
-        lines.append(f"   {acc['status']} · 剩余 {acc['remaining_days']} · 总计 {acc['total_points']}")
+        status = acc["status"]
+        # 「今日签到获得的积分」：成功与已签到都展示（已签到同样能拿到今日积分）
+        if acc["result"] in ("ok", "repeat") and acc.get("earned") is not None:
+            status += f" · 今日 +{acc['earned']} 积分"
+        lines.append(f"   {status} · 剩余 {acc['remaining_days']} · 总计 {acc['total_points']}")
         tail = f"   🌐 {acc['domain']}"
         if acc.get("exchange") and acc["exchange"] != "-":
             tail += f" · {acc['exchange']}"
