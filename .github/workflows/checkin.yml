@@ -2,6 +2,14 @@ name: GLaDOS/Railgun 自动签到
 
 on:
   workflow_dispatch:
+    inputs:
+      notify:
+        description: '本次是否推送通知'
+        type: choice
+        options:
+          - 'always'   # 始终推送（默认）
+          - 'auto'     # 按脚本策略：当天已签到则静默跳过
+        default: 'always'
   schedule:
     - cron: '18 9 * * *'          # 主运行：北京时间每天 09:18
       timezone: 'Asia/Shanghai'
@@ -35,9 +43,9 @@ jobs:
 
       - name: Run checkin
         env:
-          # 手动触发时始终推送通知（便于预览/排查）；定时触发时，若当天已签到则静默跳过。
-          # 如需定时也每次都推送，在仓库 Variables 里加 NOTIFY_ALWAYS=true 即可。
-          NOTIFY_ALWAYS: ${{ github.event_name == 'workflow_dispatch' || vars.NOTIFY_ALWAYS == 'true' }}
+          # 手动触发默认始终推送（便于预览/排查），也可选 auto 让脚本按策略决定；
+          # 定时触发时按脚本策略：当天已签到则静默跳过。仓库 Variables 里 NOTIFY_ALWAYS=true 可强制每次都推送。
+          NOTIFY_ALWAYS: ${{ vars.NOTIFY_ALWAYS == 'true' || (github.event_name == 'workflow_dispatch' && inputs.notify == 'always') }}
           COOKIES: ${{ secrets.COOKIES }}
           GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
           DOMAINS: ${{ secrets.DOMAINS }}
