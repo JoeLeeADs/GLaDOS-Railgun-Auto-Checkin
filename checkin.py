@@ -739,6 +739,8 @@ def main() -> int:
     # 手动触发时 workflow 会注入 NOTIFY_ALWAYS=true，此时始终推送（便于预览/排查）。
     notify_always = os.getenv("NOTIFY_ALWAYS", "").strip().lower() in ("1", "true", "yes", "on")
     noop_run = (ok == 0 and fail == 0 and repeat > 0)
+    if notify_always:
+        logger.info("已启用强制推送（NOTIFY_ALWAYS=true）：本轮始终推送通知")
     if noop_run and not notify_always:
         logger.info("本轮无新签到事件（%d 个账号均已签到），按策略跳过推送；如需强制推送请设置 NOTIFY_ALWAYS=true", repeat)
         pushed_ok, pushed_cfg = 0, 0
