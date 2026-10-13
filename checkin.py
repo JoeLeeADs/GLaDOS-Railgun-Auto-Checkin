@@ -40,7 +40,7 @@ if hasattr(time, "tzset"):
     except Exception:
         pass
 
-VERSION = "v1.3.0"
+VERSION = "v1.3.1"
 
 logging.basicConfig(
     level=logging.INFO,
