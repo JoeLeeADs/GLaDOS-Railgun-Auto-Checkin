@@ -681,9 +681,14 @@ def main() -> int:
         lines.append(sep)
         lines.append(f"{acc['index']}. {acc['email']}")
         status = acc["status"]
-        # 「今日签到获得的积分」：成功与已签到都展示（已签到同样能拿到今日积分）
-        if acc["result"] in ("ok", "repeat") and acc.get("earned") is not None:
-            status += f" · 今日 +{acc['earned']} 积分"
+        earned = acc.get("earned")
+        # 「今日签到获得的积分」：
+        #   - 签到成功 → 显示本轮实际获得的 +N
+        #   - 已签到   → 接口只回 points=0（不带当日积分），故明确标注「今日已领」，避免误解为今天没得分
+        if acc["result"] == "ok":
+            status += f" · 今日 +{earned if earned is not None else 0} 积分"
+        elif acc["result"] == "repeat":
+            status += f" · 今日 +{earned} 积分" if earned else " · 今日已领"
         lines.append(f"   {status} · 剩余 {acc['remaining_days']} · 总计 {acc['total_points']}")
         tail = f"   🌐 {acc['domain']}"
         if acc.get("exchange") and acc["exchange"] != "-":
