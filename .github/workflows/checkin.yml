@@ -13,9 +13,7 @@ on:
   schedule:
     - cron: '18 9 * * *'          # 主运行：北京时间每天 09:18
       timezone: 'Asia/Shanghai'
-    - cron: '18 14 * * *'         # 兜底①：北京时间 14:18（当天已签到则静默跳过，不重复推送）
-      timezone: 'Asia/Shanghai'
-    - cron: '18 21 * * *'         # 兜底②：北京时间 21:18（同上）
+    - cron: '18 21 * * *'         # 兜底：北京时间 21:18（当天已签到则静默跳过，不重复推送）
       timezone: 'Asia/Shanghai'
     - cron: '0 0 1 * *'           # 每月 1 号空提交保活，防止 Actions 被自动停用
       timezone: 'Asia/Shanghai'
