@@ -10,6 +10,8 @@ GLaDOS / Railgun 自动签到（合体版）
   - 8 路推送：PushDeer / Server酱 / Telegram / PushPlus / 钉钉 / 飞书 / 企业微信 / 云湖
   - Cookie 前缀无关校验 + 归一化 + 隐私脱敏（邮箱/Cookie 自动打码）
   - 积分兑换阈值保护（总积分够才兑，不浪费）
+  - 签到失败自动重试（网络/HTTP/未知失败各重试一次；鉴权失败不重试）
+  - 定时兜底：一天可触发多次，当天已签到则静默跳过推送，不重复刷屏
   - 网络重试 + 退出码区分「业务失败」与「通知失败」
 
 仅依赖 requests，可直接跑在 GitHub Actions。
@@ -38,7 +40,7 @@ if hasattr(time, "tzset"):
     except Exception:
         pass
 
-VERSION = "v1.2.1"
+VERSION = "v1.3.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,6 +61,11 @@ MAX_DELAY = 2.0            # 账号间随机延迟上限（秒）
 CONTENT_MAX_LENGTH = 3000  # 推送汇总内容统一长度上限
 COOKIE_MASK_LENGTH = 10    # Cookie 脱敏前后保留字符数
 COOKIE_MIN_LENGTH = 24     # Cookie 低于此长度整体脱敏
+
+# 签到失败自动重试：总尝试次数 = 1(原始) + (MAX-1) 次重试
+# 仅对「可恢复失败」（网络错误 / HTTP 错误 / 未知业务失败）重试；鉴权失败重试无意义，不重试
+CHECKIN_MAX_ATTEMPTS = 2
+CHECKIN_RETRY_DELAY = 5    # 重试前等待秒数
 
 # 候选域名（自适应探测；可用 DOMAINS 环境变量覆盖，逗号分隔）
 DEFAULT_DOMAINS = [
@@ -226,6 +233,12 @@ def validate_cookie(cookie: str) -> Tuple[bool, str]:
     if incomplete:
         return False, f"Cookie 会话字段不成对：前缀 {incomplete} 缺少 sess 或 sess.sig；实际键名: {actual}。{COOKIE_FORMAT_HINT}"
     return False, f"Cookie 缺少 <前缀>:sess 与 <前缀>:sess.sig 字段；实际键名: {actual}。{COOKIE_FORMAT_HINT}"
+
+
+def is_auth_fail(message: str) -> bool:
+    """消息是否属于「鉴权失败」（Cookie 失效类，重试无意义）。"""
+    low = (message or "").lower()
+    return any(kw in low for kw in AUTH_FAIL_KEYWORDS)
 
 
 def classify_checkin(code: Any, message: str) -> str:
@@ -543,6 +556,7 @@ class CheckinClient:
             "index": index, "email": "unknown", "domain": "-",
             "status": "", "result": "fail",
             "earned": None,
+            "attempts": 1,
             "total_points": "-", "remaining_days": "-", "exchange": "-",
         }
 
@@ -560,25 +574,41 @@ class CheckinClient:
             return result
         result["domain"] = domain
 
-        # 2. 签到
+        # 2. 签到（失败自动重试一次；鉴权失败重试无意义，直接跳过重试）
         raw = self._do_checkin(domain, cookie)
         code = raw.get("code", -2)
         message = raw.get("message", "")
-        earned = parse_earned_points(raw)
         cls = classify_checkin(code, message)
+        attempt = 1
+        while (cls == "fail" and not is_auth_fail(message)
+               and attempt < CHECKIN_MAX_ATTEMPTS):
+            attempt += 1
+            logger.warning("账号 %d 签到失败(code=%s, message=%s)，%d 秒后重试（第 %d/%d 次）",
+                           index, code, message, CHECKIN_RETRY_DELAY, attempt, CHECKIN_MAX_ATTEMPTS)
+            time.sleep(CHECKIN_RETRY_DELAY)
+            raw = self._do_checkin(domain, cookie)
+            code = raw.get("code", -2)
+            message = raw.get("message", "")
+            cls = classify_checkin(code, message)
+
+        earned = parse_earned_points(raw)
         result["earned"] = earned
+        result["attempts"] = attempt
         # 记录签到原始响应：便于排查「积分未显示 / 接口文案变动」类问题（message 无隐私字段）
-        logger.info("账号 %d 签到响应: code=%s, points=%s, message=%s",
-                    index, code, raw.get("points"), message)
+        logger.info("账号 %d 签到响应: code=%s, points=%s, message=%s（共尝试 %d 次）",
+                    index, code, raw.get("points"), message, attempt)
+        retry_tag = "（重试后成功）" if (attempt > 1 and cls == "ok") else ""
         if cls == "ok":
-            result["status"] = "✅ 成功"
+            result["status"] = f"✅ 成功{retry_tag}"
             result["result"] = "ok"
         elif cls == "repeat":
             result["status"] = "🔄 已签到"
             result["result"] = "repeat"
         else:
-            if any(kw in (message or "").lower() for kw in AUTH_FAIL_KEYWORDS):
+            if is_auth_fail(message):
                 result["status"] = f"❌ 鉴权失败({message}) → 请重新获取 Cookie"
+            elif attempt > 1:
+                result["status"] = f"❌ 失败({message}) → 已重试 {attempt} 次仍失败"
             else:
                 result["status"] = f"❌ 失败({message})"
             result["result"] = "fail"
@@ -704,7 +734,16 @@ def main() -> int:
     logger.info("%s", content)
     logger.info("%s", "=" * 50)
 
-    pushed_ok, pushed_cfg = push_all(title, content)
+    # 通知抑制：定时任务一天会触发多次（主运行 + 兜底），若本轮所有账号均为「已签到」，
+    # 说明当天签到早已完成、本轮没有任何新事件 —— 跳过推送，避免重复通知刷屏。
+    # 手动触发时 workflow 会注入 NOTIFY_ALWAYS=true，此时始终推送（便于预览/排查）。
+    notify_always = os.getenv("NOTIFY_ALWAYS", "").strip().lower() in ("1", "true", "yes", "on")
+    noop_run = (ok == 0 and fail == 0 and repeat > 0)
+    if noop_run and not notify_always:
+        logger.info("本轮无新签到事件（%d 个账号均已签到），按策略跳过推送；如需强制推送请设置 NOTIFY_ALWAYS=true", repeat)
+        pushed_ok, pushed_cfg = 0, 0
+    else:
+        pushed_ok, pushed_cfg = push_all(title, content)
 
     # 区分「业务失败」与「通知失败」：全部账号失败 → 退出码 1（CI 标红）
     if ok == 0 and repeat == 0 and len(cookies) > 0:
