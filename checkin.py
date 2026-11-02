@@ -684,7 +684,19 @@ class CheckinClient:
                                         result["remaining_days"] = days_after
                             except Exception:
                                 pass
-                            result["exchange"] = f"🎁 兑换成功(+{days_gain}天) 剩余 {days_before}→{days_after}"
+                            # 积分已被扣减，一并刷新，避免通知里仍显示兑换前的总额
+                            try:
+                                p2 = self._get_json(domain, POINTS_PATH, cookie)
+                                if p2:
+                                    pts2 = p2.get("points")
+                                    if pts2 is None:
+                                        pts2 = (p2.get("data") or {}).get("points")
+                                    if pts2 is not None:
+                                        result["total_points"] = f"{safe_int_str(pts2)} 积分"
+                            except Exception:
+                                pass
+                            result["exchange"] = (f"🎁 兑换成功(+{days_gain}天/-{req_pts}分)"
+                                                  f" 剩余 {days_before}→{days_after}")
                             logger.info("账号 %d 兑换成功：%s → %s（消耗 %d 积分）",
                                         index, days_before, days_after, req_pts)
                         else:
