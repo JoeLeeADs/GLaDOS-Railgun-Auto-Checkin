@@ -10,6 +10,19 @@ on:
           - 'always'   # 始终推送（默认）
           - 'auto'     # 按脚本策略：当天已签到则静默跳过
         default: 'always'
+      exchange_plan:
+        description: '本次兑换计划（none=不兑换；仅对本次运行生效，不写入 Secrets）'
+        type: choice
+        options:
+          - 'none'
+          - 'plan100'   # 100 积分 → 10 天
+          - 'plan200'   # 200 积分 → 30 天
+          - 'plan500'   # 500 积分 → 100 天
+        default: 'none'
+      exchange_emails:
+        description: '本次只对这些邮箱兑换（逗号分隔，如 a@x.com,b@y.com；留空=不限）'
+        type: string
+        default: ''
   schedule:
     - cron: '18 9 * * *'          # 主运行：北京时间每天 09:18
       timezone: 'Asia/Shanghai'
@@ -47,8 +60,10 @@ jobs:
           COOKIES: ${{ secrets.COOKIES }}
           GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
           DOMAINS: ${{ secrets.DOMAINS }}
-          EXCHANGE_PLAN: ${{ secrets.EXCHANGE_PLAN }}
+          EXCHANGE_PLAN: ${{ inputs.exchange_plan || secrets.EXCHANGE_PLAN }}
           GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
+          # 兑换邮箱白名单：手动触发可临时指定，也可用仓库 Variables 长期限定
+          EXCHANGE_EMAILS: ${{ inputs.exchange_emails || vars.EXCHANGE_EMAILS }}
           SENDKEY: ${{ secrets.SENDKEY }}
           SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
