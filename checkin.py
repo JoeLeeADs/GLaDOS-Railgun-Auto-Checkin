@@ -9,7 +9,7 @@ GLaDOS / Railgun 自动签到（合体版）
   - 设备平台自适应：code 4 device-mismatch 时自动按 loginDevice 切换 UA 重试
   - 8 路推送：PushDeer / Server酱 / Telegram / PushPlus / 钉钉 / 飞书 / 企业微信 / 云湖
   - Cookie 前缀无关校验 + 归一化 + 隐私脱敏（邮箱/Cookie 自动打码）
-  - 积分兑换阈值保护（总积分够才兑，不浪费）
+  - 积分兑换阈值保护（总积分够才兑，不浪费）+ 邮箱白名单（EXCHANGE_EMAILS 只兑指定账号）
   - 签到失败自动重试（网络/HTTP/未知失败各重试一次；鉴权失败不重试）
   - 定时兜底：一天可触发多次，当天已签到则静默跳过推送，不重复刷屏
   - 网络重试 + 退出码区分「业务失败」与「通知失败」
@@ -40,7 +40,7 @@ if hasattr(time, "tzset"):
     except Exception:
         pass
 
-VERSION = "v1.3.1"
+VERSION = "v1.4.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -486,9 +486,12 @@ def push_all(title: str, content: str) -> Tuple[int, int]:
 class CheckinClient:
     """单个会话内完成：域名探测锁定 → 签到 → 状态 → 积分 → 兑换。"""
 
-    def __init__(self, domains: List[str], exchange_plan: Optional[str]):
+    def __init__(self, domains: List[str], exchange_plan: Optional[str],
+                 exchange_emails: Optional[set] = None):
         self.domains = domains
         self.exchange_plan = exchange_plan
+        # 兑换邮箱白名单（小写）：非空时只对名单内的账号兑换，其余账号一律不兑
+        self.exchange_emails = exchange_emails or set()
         self.session = requests.Session()
         self.ua_cache: Dict[str, str] = {}
 
@@ -553,7 +556,7 @@ class CheckinClient:
 
     def run_account(self, cookie: str, index: int) -> Dict:
         result = {
-            "index": index, "email": "unknown", "domain": "-",
+            "index": index, "email": "unknown", "email_raw": "", "domain": "-",
             "status": "", "result": "fail",
             "earned": None,
             "attempts": 1,
@@ -618,7 +621,10 @@ class CheckinClient:
             s = self._get_json(domain, STATUS_PATH, cookie)
             if s:
                 data = s.get("data") or {}
-                result["email"] = mask_email(data.get("email", "unknown"))
+                # 保留原始邮箱（仅内部使用，用于兑换白名单匹配；通知里只输出脱敏值）
+                raw_email = (data.get("email") or "").strip()
+                result["email_raw"] = raw_email
+                result["email"] = mask_email(raw_email or "unknown")
                 if data.get("leftDays") is not None:
                     result["remaining_days"] = f"{safe_int_str(data['leftDays'])} 天"
         except Exception as e:
@@ -641,29 +647,54 @@ class CheckinClient:
         except Exception as e:
             logger.warning("账号 %d 积分查询失败: %s", index, e)
 
-        # 5. 兑换（仅配置了且积分达标才执行）
+        # 5. 兑换（仅配置了且积分达标才执行；配置了邮箱白名单时，只兑名单内的账号）
         if self.exchange_plan and self.exchange_plan in EXCHANGE_PLANS:
-            req_pts = EXCHANGE_PLANS[self.exchange_plan]["points"]
-            days_gain = EXCHANGE_PLANS[self.exchange_plan]["days"]
-            if total_int is None:
-                result["exchange"] = "⚠️ 兑换跳过(积分查询失败)"
-            elif total_int < req_pts:
-                result["exchange"] = f"⏭️ 积分不足({total_int}/{req_pts})"
+            # 白名单保护：未取到邮箱（状态查询失败）时一律视为「不在名单内」，宁可不兑也不误兑
+            target_email = (result["email_raw"] or "").strip().lower()
+            if self.exchange_emails and target_email not in self.exchange_emails:
+                logger.info("账号 %d(%s) 不在兑换白名单内，跳过兑换",
+                            index, result["email"] or "unknown")
+                result["exchange"] = "-"
             else:
-                try:
-                    r = self.session.post(
-                        f"https://{domain}{EXCHANGE_PATH}",
-                        headers=self._headers(domain, cookie),
-                        data={"planType": self.exchange_plan},
-                        timeout=TIMEOUT,
-                    )
-                    ex = r.json() if r.ok else {}
-                    if ex.get("code") == 0:
-                        result["exchange"] = f"🎁 兑换成功(+{days_gain}天)"
-                    else:
-                        result["exchange"] = f"⚠️ 兑换失败({ex.get('message', '')})"
-                except Exception as e:
-                    result["exchange"] = f"⚠️ 兑换异常({type(e).__name__})"
+                req_pts = EXCHANGE_PLANS[self.exchange_plan]["points"]
+                days_gain = EXCHANGE_PLANS[self.exchange_plan]["days"]
+                if total_int is None:
+                    result["exchange"] = "⚠️ 兑换跳过(积分查询失败)"
+                elif total_int < req_pts:
+                    result["exchange"] = f"⏭️ 积分不足({total_int}/{req_pts})"
+                else:
+                    days_before = result["remaining_days"]
+                    try:
+                        r = self.session.post(
+                            f"https://{domain}{EXCHANGE_PATH}",
+                            headers=self._headers(domain, cookie),
+                            data={"planType": self.exchange_plan},
+                            timeout=TIMEOUT,
+                        )
+                        ex = r.json() if r.ok else {}
+                        if ex.get("code") == 0:
+                            # 兑换成功后重查一次状态，确认天数真的到账（而不是只看接口说了"成功"）
+                            days_after = "-"
+                            try:
+                                s2 = self._get_json(domain, STATUS_PATH, cookie)
+                                if s2:
+                                    d2 = s2.get("data") or {}
+                                    if d2.get("leftDays") is not None:
+                                        days_after = f"{safe_int_str(d2['leftDays'])} 天"
+                                        result["remaining_days"] = days_after
+                            except Exception:
+                                pass
+                            result["exchange"] = f"🎁 兑换成功(+{days_gain}天) 剩余 {days_before}→{days_after}"
+                            logger.info("账号 %d 兑换成功：%s → %s（消耗 %d 积分）",
+                                        index, days_before, days_after, req_pts)
+                        else:
+                            result["exchange"] = f"⚠️ 兑换失败({ex.get('message', '')})"
+                            logger.warning("账号 %d 兑换失败: code=%s, message=%s",
+                                           index, ex.get("code"), ex.get("message"))
+                    except Exception as e:
+                        # 兑换是非幂等操作，异常不重试（避免重复扣积分），仅如实报告
+                        result["exchange"] = f"⚠️ 兑换异常({type(e).__name__})"
+                        logger.warning("账号 %d 兑换请求异常（不重试，避免重复扣分）: %s", index, e)
 
         return result
 
@@ -676,16 +707,24 @@ def main() -> int:
     domains = [d.strip() for d in (os.getenv("DOMAINS") or "").split(",") if d.strip()] or list(DEFAULT_DOMAINS)
 
     raw_plan = (os.getenv("EXCHANGE_PLAN") or os.getenv("GLADOS_EXCHANGE_PLAN") or "").strip()
+    if raw_plan.lower() in ("none", "no", "-"):
+        raw_plan = ""   # 手动触发时选择「不兑换」的占位值
     exchange_plan = raw_plan if raw_plan in EXCHANGE_PLANS else None
     if raw_plan and not exchange_plan:
         logger.warning("EXCHANGE_PLAN 值 '%s' 无效，可选: %s；本次跳过兑换", raw_plan, "/".join(EXCHANGE_PLANS.keys()))
+
+    # 兑换邮箱白名单：非空时只对名单内账号兑换（逗号/分号/空白分隔，大小写不敏感）
+    raw_emails = (os.getenv("EXCHANGE_EMAILS") or "").strip()
+    exchange_emails = {e.strip().lower() for e in re.split(r"[,;，；\s]+", raw_emails) if e.strip()}
+    if exchange_emails:
+        logger.info("兑换白名单已启用：%s（名单外账号一律不兑换）", ", ".join(sorted(exchange_emails)))
 
     if not cookies:
         push_all("GLaDOS 签到", "❌ 未检测到 COOKIES / GLADOS_COOKIES，请配置 GitHub Secrets")
         return 1
 
     logger.info("%s 检测到 %d 个账号，候选域名: %s", VERSION, len(cookies), ", ".join(domains))
-    client = CheckinClient(domains, exchange_plan)
+    client = CheckinClient(domains, exchange_plan, exchange_emails)
     ok = fail = repeat = 0
     results: List[Dict[str, Any]] = []
 
