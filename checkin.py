@@ -683,6 +683,12 @@ def report_to_lifeloom(results: List[Dict[str, Any]], summary: Dict[str, int],
 
     account_count = len(payload.get("accounts", []))
     logger.info("LifeLoom 上报开始：%d 个账号 / %d 字节", account_count, len(body))
+    # 字段库存（只打键名，不打值）：便于日后核对「哪些可选字段本次真的带上了」
+    field_names = sorted({k for acc in payload.get("accounts", []) for k in acc})
+    status_keys = sorted({k for acc in payload.get("accounts", [])
+                          for k in (acc.get("platform_status") or {})})
+    logger.info("LifeLoom 字段: %s", ", ".join(field_names))
+    logger.info("LifeLoom 平台状态字段: %s", ", ".join(status_keys) or "（无）")
 
     attempts = LIFELOOM_MAX_RETRY + 1
     for attempt in range(1, attempts + 1):
