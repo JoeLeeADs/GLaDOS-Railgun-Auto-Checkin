@@ -28,7 +28,7 @@ import hmac
 import base64
 import urllib.parse
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Callable
 
 import requests
@@ -117,14 +117,19 @@ LIFELOOM_RETRY_DELAY = 30        # 每次重试前等待秒数（≥30s，且是
 REPORT_SOURCE = "glados-railgun-checkin"
 
 # 平台 status 接口字段名各版本不统一，按候选名（大小写不敏感）尽力抽取；抽不到就不给该字段
+# 到期时间：只认「确实是时间」的值（布尔/普通数字会被丢弃，避免把 expired:false 当成日期）
 PLAN_EXPIRE_KEYS = (
-    "expireat", "expiredat", "expiretime", "expiretime", "expires", "expiredate",
+    "expiredat", "expireat", "expiretime", "expires", "expiredate", "expired",
     "endtime", "planexpire", "vipexpireat", "vip_expire_at", "expire_at",
 )
+# 连续签到天数：实测 status 接口给的 `days` 更像「套餐总天数」而非连续签到，
+# 误映射会把错数据灌给下游，故不收录 `days`；平台没给就整个字段不给。
 STREAK_KEYS = (
     "checkincount", "continuousdays", "continuouscheckindays", "checkinstreak",
     "streak", "continuous_count", "checkindays",
 )
+# 推算到期日用的系统日期字段（平台只给 leftDays 时，用它加天数得出一个大致的到期日）
+SYSTEM_DATE_KEYS = ("system_date", "systemdate", "date", "today")
 
 
 # ===================== 工具函数 =====================
@@ -531,6 +536,66 @@ def _pick_field(data: Dict[str, Any], keys: Tuple[str, ...]) -> Any:
     return None
 
 
+def _as_time_string(val: Any) -> Optional[str]:
+    """把值规整成时间字符串；明显不是时间的（布尔/短数字/纯文本）返回 None。
+
+    平台可能返回 `expired: false` 这类布尔标志，绝不能当成到期时间，故做类型校验。
+    """
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        ts = float(val)
+        if ts > 1e12:          # 毫秒时间戳
+            ts /= 1000
+        if 1e9 <= ts <= 4e9:   # 2001~2096 年之间才认为可信
+            try:
+                return datetime.fromtimestamp(ts).astimezone().isoformat(timespec="seconds")
+            except Exception:  # noqa: BLE001
+                return None
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+    if re.fullmatch(r"\d{13}", s) or re.fullmatch(r"\d{10}", s):
+        return _as_time_string(int(s))
+    # 形如 2026-12-04 / 2026-12-04T00:00:00Z / 2026/12/04 的才认，其余（如 "false"）丢弃
+    if re.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}", s):
+        return s
+    return None
+
+
+def _pick_time_field(data: Dict[str, Any], keys: Tuple[str, ...]) -> Optional[str]:
+    """按候选键名取第一个「确实是时间」的值。"""
+    if not isinstance(data, dict):
+        return None
+    lowered = {str(k).lower(): v for k, v in data.items()}
+    for key in keys:
+        parsed = _as_time_string(lowered.get(key))
+        if parsed:
+            return parsed
+    return None
+
+
+def _estimate_expire(data: Dict[str, Any], left_days: Optional[int]) -> Optional[str]:
+    """由 status 的 system_date + leftDays 推算到期日（日期粒度，仅作参考）。
+
+    平台通常只给「剩余天数」不给「到期时间」，这个字段就是把它换算成一个便于展示的日期。
+    """
+    if left_days is None:
+        return None
+    sys_date = _pick_field(data, SYSTEM_DATE_KEYS)
+    if not sys_date:
+        return None
+    m = re.match(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})", str(sys_date).strip())
+    if not m:
+        return None
+    try:
+        base = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        return (base + timedelta(days=int(left_days))).strftime("%Y-%m-%d")
+    except (TypeError, ValueError):
+        return None
+
+
 def _clean_platform_status(data: Dict[str, Any]) -> Dict[str, Any]:
     """原样透传平台 status 接口的 data，仅剔除疑似凭据字段。
 
@@ -569,6 +634,7 @@ def build_lifeloom_payload(results: List[Dict[str, Any]], summary: Dict[str, int
     accounts: List[Dict[str, Any]] = []
     for acc in results:
         status_data = acc.get("status_data") or {}
+        left_days = acc.get("remaining_days_int")
         item: Dict[str, Any] = {
             "index": acc.get("index"),
             # 账号标识：优先原始邮箱（稳定唯一）；拿不到邮箱时才没有该字段
@@ -582,8 +648,10 @@ def build_lifeloom_payload(results: List[Dict[str, Any]], summary: Dict[str, int
             "checkin_message": acc.get("message") or None,
             "checked_at": acc.get("checked_at") or None,
             "total_points": acc.get("total_points_int"),
-            "remaining_days": acc.get("remaining_days_int"),
-            "plan_expires_at": _pick_field(status_data, PLAN_EXPIRE_KEYS),
+            "remaining_days": left_days,
+            # 到期时间：平台真给了时间就用它；只给剩余天数时，用 system_date + leftDays 推算一个日期
+            "plan_expires_at": _pick_time_field(status_data, PLAN_EXPIRE_KEYS),
+            "plan_expires_estimated": _estimate_expire(status_data, left_days),
             "streak_days": _pick_field(status_data, STREAK_KEYS),
             "attempts": acc.get("attempts"),
             "exchange": acc.get("exchange_info"),
