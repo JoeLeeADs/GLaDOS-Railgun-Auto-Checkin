@@ -13,12 +13,14 @@ GLaDOS / Railgun 自动签到（合体版）
   - 签到失败自动重试（网络/HTTP/未知失败各重试一次；鉴权失败不重试）
   - 定时兜底：一天可触发多次，当天已签到则静默跳过推送，不重复刷屏
   - 网络重试 + 退出码区分「业务失败」与「通知失败」
+  - LifeLoom 上报（双写）：原有通知不变，另把本轮全量结构化结果 POST 给 LifeLoom 签到聚合页
 
 仅依赖 requests，可直接跑在 GitHub Actions。
 """
 import os
 import re
 import sys
+import json
 import time
 import random
 import hashlib
@@ -26,6 +28,7 @@ import hmac
 import base64
 import urllib.parse
 import logging
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, Callable
 
 import requests
@@ -40,7 +43,7 @@ if hasattr(time, "tzset"):
     except Exception:
         pass
 
-VERSION = "v1.4.0"
+VERSION = "v1.5.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -105,6 +108,23 @@ EXCHANGE_PLANS = {
 
 TELEGRAM_MAX_LENGTH = 4000
 TELEGRAM_TRUNCATE_LENGTH = 3990
+
+# ---- LifeLoom 上报（家庭签到聚合页，双写出口）----
+# 地址走环境变量 LIFELOOM_HOOK_URL，不写死在代码里；未配置则整段逻辑自动跳过。
+LIFELOOM_MAX_BYTES = 32 * 1024   # 接口请求体上限 32KB，超了会 413
+LIFELOOM_MAX_RETRY = 2           # 失败后最多再重试 2 次（总尝试 3 次）
+LIFELOOM_RETRY_DELAY = 30        # 每次重试前等待秒数（≥30s，且是上限为 1 分钟的温和频率）
+REPORT_SOURCE = "glados-railgun-checkin"
+
+# 平台 status 接口字段名各版本不统一，按候选名（大小写不敏感）尽力抽取；抽不到就不给该字段
+PLAN_EXPIRE_KEYS = (
+    "expireat", "expiredat", "expiretime", "expiretime", "expires", "expiredate",
+    "endtime", "planexpire", "vipexpireat", "vip_expire_at", "expire_at",
+)
+STREAK_KEYS = (
+    "checkincount", "continuousdays", "continuouscheckindays", "checkinstreak",
+    "streak", "continuous_count", "checkindays",
+)
 
 
 # ===================== 工具函数 =====================
@@ -482,6 +502,225 @@ def push_all(title: str, content: str) -> Tuple[int, int]:
     return success, len(configured)
 
 
+# ===================== LifeLoom 上报 =====================
+# 双写出口：原有 8 路通知完全不动，另把「本轮全量结构化结果」POST 给 LifeLoom。
+# 硬约束：上报任何环节异常都在本段内吞掉，绝不影响签到主流程与退出码。
+
+def now_iso() -> str:
+    """当前时间 ISO8601（带时区偏移；脚本已强制 Asia/Shanghai，故为 +08:00）。"""
+    try:
+        return datetime.now().astimezone().isoformat(timespec="seconds")
+    except Exception:  # noqa: BLE001
+        return time.strftime("%Y-%m-%dT%H:%M:%S+08:00")
+
+
+def platform_of(domain: str) -> str:
+    """按域名判断平台：railgun.* → Railgun，其余 → GLaDOS（同一套 API，仅品牌域名不同）。"""
+    return "Railgun" if (domain or "").startswith("railgun") else "GLaDOS"
+
+
+def _pick_field(data: Dict[str, Any], keys: Tuple[str, ...]) -> Any:
+    """在 dict 中按候选键名（大小写不敏感）取第一个非空值，取不到返回 None。"""
+    if not isinstance(data, dict):
+        return None
+    lowered = {str(k).lower(): v for k, v in data.items()}
+    for key in keys:
+        val = lowered.get(key)
+        if val not in (None, "", [], {}):
+            return val
+    return None
+
+
+def _clean_platform_status(data: Dict[str, Any]) -> Dict[str, Any]:
+    """原样透传平台 status 接口的 data，仅剔除疑似凭据字段。
+
+    原则是「宁可多给」：不做无谓裁剪，字段取舍交给 LifeLoom 侧。
+    """
+    if not isinstance(data, dict):
+        return {}
+    blocked = ("token", "cookie", "secret", "password", "passwd", "session", "authorization")
+    return {k: v for k, v in data.items() if not any(b in str(k).lower() for b in blocked)}
+
+
+def _prune_empty(obj: Any) -> Any:
+    """递归删掉 None / 空串 / 空容器：不存在的字段整个不给，也不拿 0 或 null 占位。"""
+    if isinstance(obj, dict):
+        return {k: _prune_empty(v) for k, v in obj.items()
+                if v is not None and v != "" and v != [] and v != {}}
+    if isinstance(obj, list):
+        return [_prune_empty(x) for x in obj]
+    return obj
+
+
+def _trigger_name() -> str:
+    """本次运行来自哪里：schedule / manual / local。"""
+    event = (os.getenv("GITHUB_EVENT_NAME") or "").strip()
+    if event == "workflow_dispatch":
+        return "manual"
+    if event == "schedule":
+        return "schedule"
+    return event or "local"
+
+
+def build_lifeloom_payload(results: List[Dict[str, Any]], summary: Dict[str, int],
+                           notify_title: str, notify_text: str,
+                           reported_at: Optional[str] = None) -> Dict[str, Any]:
+    """把一轮签到结果组装成上报体（字段尽量给全，取不到的留空由 _prune_empty 剔除）。"""
+    accounts: List[Dict[str, Any]] = []
+    for acc in results:
+        status_data = acc.get("status_data") or {}
+        item: Dict[str, Any] = {
+            "index": acc.get("index"),
+            # 账号标识：优先原始邮箱（稳定唯一）；拿不到邮箱时才没有该字段
+            "account": acc.get("email_raw") or None,
+            "account_masked": acc.get("email") if acc.get("email") != "unknown" else None,
+            "platform": platform_of(acc.get("domain", "")),
+            "domain": None if acc.get("domain") in (None, "", "-") else acc.get("domain"),
+            "checkin_result": {"ok": "success", "repeat": "already_checked_in",
+                               "fail": "failed"}.get(acc.get("result"), "unknown"),
+            "checkin_code": acc.get("code"),
+            "checkin_message": acc.get("message") or None,
+            "checked_at": acc.get("checked_at") or None,
+            "total_points": acc.get("total_points_int"),
+            "remaining_days": acc.get("remaining_days_int"),
+            "plan_expires_at": _pick_field(status_data, PLAN_EXPIRE_KEYS),
+            "streak_days": _pick_field(status_data, STREAK_KEYS),
+            "attempts": acc.get("attempts"),
+            "exchange": acc.get("exchange_info"),
+        }
+        # 本次获得积分：成功时 0 也是真实值；「已签到」且解析不到数字时不填（不拿 0 占位）
+        earned = acc.get("earned")
+        if acc.get("result") == "ok" and earned is not None:
+            item["earned_points"] = earned
+        elif acc.get("result") == "repeat" and earned:
+            item["earned_points"] = earned
+        cleaned = _clean_platform_status(status_data)
+        if cleaned:
+            item["platform_status"] = cleaned
+        accounts.append(item)
+
+    payload = {
+        "source": REPORT_SOURCE,
+        "script_version": VERSION,
+        "reported_at": reported_at or now_iso(),
+        "timezone": "Asia/Shanghai",
+        "trigger": _trigger_name(),
+        "summary": {
+            "accounts": len(results),
+            "success": summary.get("ok", 0),
+            "already_checked_in": summary.get("repeat", 0),
+            "failed": summary.get("fail", 0),
+        },
+        "notification_title": notify_title,
+        "notification_text": notify_text,
+        "accounts": accounts,
+    }
+    return _prune_empty(payload)
+
+
+def _encode_payload(payload: Dict[str, Any]) -> bytes:
+    """紧凑序列化（中文不转义），字节数即实际上行体积。"""
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _fit_payload(payload: Dict[str, Any]) -> Optional[bytes]:
+    """把请求体压到 32KB 以内：先丢可再生的文本，再丢平台原始状态，最后才截断账号。"""
+    body = _encode_payload(payload)
+    if len(body) <= LIFELOOM_MAX_BYTES:
+        return body
+
+    if payload.pop("notification_text", None) is not None:
+        body = _encode_payload(payload)
+        logger.warning("LifeLoom 请求体超过 32KB，已丢弃 notification_text（现 %d 字节）", len(body))
+
+    if len(body) > LIFELOOM_MAX_BYTES:
+        for acc in payload.get("accounts", []):
+            acc.pop("platform_status", None)
+        body = _encode_payload(payload)
+        logger.warning("LifeLoom 请求体仍超限，已丢弃 platform_status（现 %d 字节）", len(body))
+
+    omitted = 0
+    while len(body) > LIFELOOM_MAX_BYTES and len(payload.get("accounts", [])) > 1:
+        payload["accounts"].pop()
+        omitted += 1
+        body = _encode_payload(payload)
+    if omitted:
+        payload["truncated"] = True
+        payload["accounts_omitted"] = omitted
+        body = _encode_payload(payload)
+        logger.warning("LifeLoom 请求体仍超限，已省略 %d 个账号（保留前 %d 个）",
+                       omitted, len(payload.get("accounts", [])))
+
+    if len(body) > LIFELOOM_MAX_BYTES:
+        logger.error("LifeLoom 请求体 %d 字节，压不到 32KB 以内，放弃本次上报", len(body))
+        return None
+    return body
+
+
+def report_to_lifeloom(results: List[Dict[str, Any]], summary: Dict[str, int],
+                       notify_title: str, notify_text: str) -> bool:
+    """把本轮结果上报给 LifeLoom，返回是否成功（失败只记日志，绝不影响签到主流程）。
+
+    响应约定（NestJS POST，成功是 201，没有 200）：
+      201 收下了 / 413 太大（不重试）/ 429 发太快（按 Retry-After 或 30s 后再试）/ 其他 4xx 不重试
+    """
+    url = (os.getenv("LIFELOOM_HOOK_URL") or "").strip()
+    if not url:
+        logger.info("未配置 LIFELOOM_HOOK_URL，跳过 LifeLoom 上报")
+        return False
+    if not url.lower().startswith(("http://", "https://")):
+        logger.warning("LIFELOOM_HOOK_URL 格式异常（需 http/https 开头），跳过 LifeLoom 上报")
+        return False
+
+    try:
+        payload = build_lifeloom_payload(results, summary, notify_title, notify_text)
+        body = _fit_payload(payload)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("LifeLoom 上报数据组装异常（不影响签到主流程）: %s", e)
+        return False
+    if body is None:
+        return False
+
+    account_count = len(payload.get("accounts", []))
+    logger.info("LifeLoom 上报开始：%d 个账号 / %d 字节", account_count, len(body))
+
+    attempts = LIFELOOM_MAX_RETRY + 1
+    for attempt in range(1, attempts + 1):
+        wait = LIFELOOM_RETRY_DELAY
+        try:
+            resp = requests.post(url, data=body,
+                                 headers={"Content-Type": "application/json"},
+                                 timeout=TIMEOUT)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("LifeLoom 上报异常（第 %d/%d 次）: %s", attempt, attempts, e)
+        else:
+            code = resp.status_code
+            if code == 201:
+                logger.info("LifeLoom 上报成功：HTTP 201，%d 个账号 / %d 字节，上报时间 %s",
+                            account_count, len(body), payload.get("reported_at"))
+                return True
+            if code == 413:
+                logger.error("LifeLoom 拒收：HTTP 413 请求体过大（%d 字节），不再重试", len(body))
+                return False
+            if code == 429:
+                retry_after = (resp.headers.get("Retry-After") or "").strip()
+                if retry_after.isdigit():
+                    wait = max(LIFELOOM_RETRY_DELAY, int(retry_after))
+                logger.warning("LifeLoom 限流：HTTP 429，%d 秒后重试", wait)
+            elif 400 <= code < 500:
+                detail = (resp.text or "")[:200]
+                logger.error("LifeLoom 拒收：HTTP %d %s（4xx 不重试）", code, detail)
+                return False
+            else:
+                logger.warning("LifeLoom 上报失败：HTTP %d %s（第 %d/%d 次）",
+                               code, (resp.text or "")[:200], attempt, attempts)
+        if attempt < attempts:
+            time.sleep(wait)
+
+    logger.error("LifeLoom 上报失败：已尝试 %d 次后放弃（不影响签到主流程）", attempts)
+    return False
+
+
 # ===================== 签到客户端 =====================
 class CheckinClient:
     """单个会话内完成：域名探测锁定 → 签到 → 状态 → 积分 → 兑换。"""
@@ -560,19 +799,25 @@ class CheckinClient:
             "status": "", "result": "fail",
             "earned": None,
             "attempts": 1,
+            # 以下字段供 LifeLoom 上报使用（结构化原始值，通知排版不受影响）
+            "code": None, "message": "", "checked_at": "",
+            "status_data": {}, "exchange_info": None,
             "total_points": "-", "remaining_days": "-", "exchange": "-",
+            "total_points_int": None, "remaining_days_int": None,
         }
 
         # 0. Cookie 格式预校验
         ok, err = validate_cookie(cookie)
         if not ok:
             result["status"] = f"❌ Cookie格式异常({err})"
+            result["message"] = err
             return result
 
         # 1. 域名自适应探测
         domain = self._resolve_domain(cookie)
         if not domain:
             result["status"] = "❌ 鉴权失败 → 请重新获取 Cookie 或检查 DOMAINS"
+            result["message"] = "所有候选域名均鉴权失败（Cookie 失效或不适用于这些域名）"
             logger.warning("账号 %d 所有候选域名均鉴权失败: %s", index, mask_cookie(cookie))
             return result
         result["domain"] = domain
@@ -600,6 +845,10 @@ class CheckinClient:
         # 记录签到原始响应：便于排查「积分未显示 / 接口文案变动」类问题（message 无隐私字段）
         logger.info("账号 %d 签到响应: code=%s, points=%s, message=%s（共尝试 %d 次）",
                     index, code, raw.get("points"), message, attempt)
+        # 结构化留档（上报用）：原始 code / message / 完成时间
+        result["code"] = code
+        result["message"] = str(message or "")
+        result["checked_at"] = now_iso()
         retry_tag = "（重试后成功）" if (attempt > 1 and cls == "ok") else ""
         if cls == "ok":
             result["status"] = f"✅ 成功{retry_tag}"
@@ -621,12 +870,18 @@ class CheckinClient:
             s = self._get_json(domain, STATUS_PATH, cookie)
             if s:
                 data = s.get("data") or {}
+                if isinstance(data, dict):
+                    result["status_data"] = data
                 # 保留原始邮箱（仅内部使用，用于兑换白名单匹配；通知里只输出脱敏值）
                 raw_email = (data.get("email") or "").strip()
                 result["email_raw"] = raw_email
                 result["email"] = mask_email(raw_email or "unknown")
                 if data.get("leftDays") is not None:
                     result["remaining_days"] = f"{safe_int_str(data['leftDays'])} 天"
+                    try:
+                        result["remaining_days_int"] = int(float(data["leftDays"]))
+                    except (TypeError, ValueError):
+                        pass
         except Exception as e:
             logger.warning("账号 %d 状态查询失败: %s", index, e)
 
@@ -644,6 +899,7 @@ class CheckinClient:
                         total_int = int(float(pts))
                     except (TypeError, ValueError):
                         total_int = None
+                    result["total_points_int"] = total_int
         except Exception as e:
             logger.warning("账号 %d 积分查询失败: %s", index, e)
 
@@ -655,15 +911,24 @@ class CheckinClient:
                 logger.info("账号 %d(%s) 不在兑换白名单内，跳过兑换",
                             index, result["email"] or "unknown")
                 result["exchange"] = "-"
+                result["exchange_info"] = {"status": "skipped", "reason": "not_in_whitelist"}
             else:
                 req_pts = EXCHANGE_PLANS[self.exchange_plan]["points"]
                 days_gain = EXCHANGE_PLANS[self.exchange_plan]["days"]
                 if total_int is None:
                     result["exchange"] = "⚠️ 兑换跳过(积分查询失败)"
+                    result["exchange_info"] = {"status": "skipped", "reason": "points_query_failed",
+                                               "plan": self.exchange_plan,
+                                               "cost_points": req_pts, "gained_days": days_gain}
                 elif total_int < req_pts:
                     result["exchange"] = f"⏭️ 积分不足({total_int}/{req_pts})"
+                    result["exchange_info"] = {"status": "insufficient_points",
+                                               "plan": self.exchange_plan,
+                                               "cost_points": req_pts, "gained_days": days_gain,
+                                               "available_points": total_int}
                 else:
                     days_before = result["remaining_days"]
+                    days_before_int = result["remaining_days_int"]
                     try:
                         r = self.session.post(
                             f"https://{domain}{EXCHANGE_PATH}",
@@ -675,6 +940,7 @@ class CheckinClient:
                         if ex.get("code") == 0:
                             # 兑换成功后重查一次状态，确认天数真的到账（而不是只看接口说了"成功"）
                             days_after = "-"
+                            days_after_int: Optional[int] = None
                             try:
                                 s2 = self._get_json(domain, STATUS_PATH, cookie)
                                 if s2:
@@ -682,6 +948,11 @@ class CheckinClient:
                                     if d2.get("leftDays") is not None:
                                         days_after = f"{safe_int_str(d2['leftDays'])} 天"
                                         result["remaining_days"] = days_after
+                                        try:
+                                            days_after_int = int(float(d2["leftDays"]))
+                                            result["remaining_days_int"] = days_after_int
+                                        except (TypeError, ValueError):
+                                            days_after_int = None
                             except Exception:
                                 pass
                             # 积分已被扣减，一并刷新，避免通知里仍显示兑换前的总额
@@ -693,19 +964,37 @@ class CheckinClient:
                                         pts2 = (p2.get("data") or {}).get("points")
                                     if pts2 is not None:
                                         result["total_points"] = f"{safe_int_str(pts2)} 积分"
+                                        try:
+                                            result["total_points_int"] = int(float(pts2))
+                                        except (TypeError, ValueError):
+                                            pass
                             except Exception:
                                 pass
                             result["exchange"] = (f"🎁 兑换成功(+{days_gain}天/-{req_pts}分)"
                                                   f" 剩余 {days_before}→{days_after}")
+                            result["exchange_info"] = {
+                                "status": "success", "plan": self.exchange_plan,
+                                "cost_points": req_pts, "gained_days": days_gain,
+                                "remaining_before": days_before_int,
+                                "remaining_after": days_after_int,
+                                "total_points_after": result["total_points_int"],
+                            }
                             logger.info("账号 %d 兑换成功：%s → %s（消耗 %d 积分）",
                                         index, days_before, days_after, req_pts)
                         else:
                             result["exchange"] = f"⚠️ 兑换失败({ex.get('message', '')})"
+                            result["exchange_info"] = {"status": "failed", "plan": self.exchange_plan,
+                                                       "cost_points": req_pts, "gained_days": days_gain,
+                                                       "code": ex.get("code"),
+                                                       "message": ex.get("message")}
                             logger.warning("账号 %d 兑换失败: code=%s, message=%s",
                                            index, ex.get("code"), ex.get("message"))
                     except Exception as e:
                         # 兑换是非幂等操作，异常不重试（避免重复扣积分），仅如实报告
                         result["exchange"] = f"⚠️ 兑换异常({type(e).__name__})"
+                        result["exchange_info"] = {"status": "error", "plan": self.exchange_plan,
+                                                   "cost_points": req_pts, "gained_days": days_gain,
+                                                   "error": type(e).__name__}
                         logger.warning("账号 %d 兑换请求异常（不重试，避免重复扣分）: %s", index, e)
 
         return result
@@ -792,11 +1081,23 @@ def main() -> int:
     noop_run = (ok == 0 and fail == 0 and repeat > 0)
     if notify_always:
         logger.info("已启用强制推送（NOTIFY_ALWAYS=true）：本轮始终推送通知")
-    if noop_run and not notify_always:
+    suppressed = bool(noop_run and not notify_always)
+    if suppressed:
         logger.info("本轮无新签到事件（%d 个账号均已签到），按策略跳过推送；如需强制推送请设置 NOTIFY_ALWAYS=true", repeat)
         pushed_ok, pushed_cfg = 0, 0
     else:
         pushed_ok, pushed_cfg = push_all(title, content)
+
+    # LifeLoom 上报（双写出口）：与通知同频 —— 被抑制的「无新事件」轮次一并跳过，
+    # 避免同一天给聚合页重复灌同一条数据；手动触发（always）时必定上报。
+    # 整段 try/except 包住：LifeLoom 挂了绝不影响签到主流程与退出码。
+    if suppressed:
+        logger.info("本轮通知被抑制，LifeLoom 上报同步跳过")
+    else:
+        try:
+            report_to_lifeloom(results, {"ok": ok, "repeat": repeat, "fail": fail}, title, content)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("LifeLoom 上报异常（不影响签到主流程）: %s", e)
 
     # 区分「业务失败」与「通知失败」：全部账号失败 → 退出码 1（CI 标红）
     if ok == 0 and repeat == 0 and len(cookies) > 0:
