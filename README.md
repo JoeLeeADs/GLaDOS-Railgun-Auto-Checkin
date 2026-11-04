@@ -268,13 +268,17 @@ EXCHANGE_EMAILS=a@x.com,b@y.com                # 兑这两个
 | `earned_points` | **本次**签到获得的积分；`success` 时 `0` 也是真实值，`already_checked_in` 且拿不到数字时不给 | 分 | 见左 |
 | `total_points` | 签到后查询到的累计总积分（若发生兑换则为兑换扣减后的余额） | 分 | 积分查询失败时缺失 |
 | `remaining_days` | 会员/套餐剩余天数 | 天 | 状态查询失败时缺失 |
-| `plan_expires_at` | 套餐到期时间；取自平台 status 接口的到期字段（原样透传，可能是 ISO 时间或纯日期） | 时间/日期字符串 | 平台未返回该字段时缺失 |
-| `streak_days` | 连续签到天数；取自平台 status 接口的连续字段，仅平台返回时才有 | 天 | 平台未返回时缺失 |
+| `plan_expires_at` | 套餐到期时间：仅在平台 status 里**确实给出时间值**时上报（时间戳会转成 ISO）；`expired: false` 这类布尔标志不会被误当成日期 | 时间/日期字符串 | 平台未给时间值时缺失 |
+| `plan_expires_estimated` | 到期日**推算值**：平台只给「剩余天数」时，用 `system_date + leftDays` 换算成日期，仅供展示（`2026-12-02`） | 日期 `YYYY-MM-DD` | 缺 `leftDays` 或 `system_date` 时缺失 |
+| `streak_days` | 连续签到天数：仅当平台 status 明确返回连续签到字段时才给（实测当前接口未提供，故通常不出现） | 天 | 平台未返回时缺失 |
 | `attempts` | 该账号本轮实际尝试签到次数（含自动重试，1 = 一次过） | 次 | 不会缺失 |
 | `exchange` | 兑换结果对象，仅当本轮**配置了兑换计划**时出现：`status`=`success`/`failed`/`error`/`insufficient_points`/`skipped`，并附 `plan`、`cost_points`、`gained_days`、`remaining_before`、`remaining_after`、`total_points_after`、`message` 等 | 对象 | 本轮未配兑换时缺失 |
 | `platform_status` | 平台 status 接口的 `data` **原样透传**（仅剔除 token/cookie/secret/password/session 类键），字段名随平台版本变化，取舍交给你 | 对象 | 状态查询失败、或超 32KB 被瘦身时缺失 |
 
 **两条硬规则**：① 没有的信息**整个字段不给**，绝不填 `0` / `null` / `"-"` 占位；② 宁可多给 —— 平台返回什么就尽量带上，不做多余裁剪。
+
+> 📌 实测（2026-11-04，`railgun.info`）平台 status 返回的字段是：`code, created_at, days, domain, email, expired, hashed, id, leftDays, port, receive_all_emails, refer_id, referral_ratio, site, subscriptions, system_date, system_time, throttle, traffic, vip` —— 全部原样进入 `platform_status`。
+> 其中 **`days` 是套餐天数（不是连续签到天数）**，故不会映射成 `streak_days`；`expired` 实测为布尔值，故不会映射成 `plan_expires_at`。日志里会打印本次实际带上的字段清单（只打键名，不打值），方便核对。
 
 ### 超过 32KB 怎么瘦身
 
@@ -323,7 +327,8 @@ LifeLoom 上报成功：HTTP 201，4 个账号 / 2417 字节，上报时间 2026
   - 成功判定为 **HTTP 201**；`413` 不重试、`429` 按 `Retry-After`（缺省 30s）重试、其他 `4xx` 不重试、`5xx`/网络异常重试。
   - 失败重试**最多 2 次、间隔 ≥30 秒**，之后放弃；整段 `try/except` 兜底，**绝不影响签到主流程与退出码**。
   - 请求体 ≤32KB：超限按「通知正文 → 平台原始状态 → 数组尾部账号」逐级瘦身，并置 `truncated`/`accounts_omitted`。
-- **上报字段宁多不少**：账号标识、平台（GLaDOS/Railgun）、域名、签到结果 + 原始 code/message、完成时间、本次积分、累计积分、剩余天数、到期时间、连续天数、尝试次数、兑换明细、平台 status 原始透传。
+- **上报字段宁多不少**：账号标识、平台（GLaDOS/Railgun）、域名、签到结果 + 原始 code/message、完成时间、本次积分、累计积分、剩余天数、到期时间（含 `plan_expires_estimated` 推算值）、连续天数、尝试次数、兑换明细、平台 status 原始透传。
+- **不猜字段语义**：实测平台 status 的 `days` 是套餐天数、`expired` 是布尔标志，代码做了类型与语义校验，宁可不给也不灌错数据。
 - **缺失即不给**：不存在的信息整个字段省略，不用 `0` / `null` / `-` 占位（`success` 时的 `earned_points: 0` 例外，那是真实值）。
 - 与通知**同频上报**：被抑制的「当天已签到」兜底轮次同步跳过，保证聚合页每天只有一条真实数据。
 - **文档**：新增「LifeLoom 上报（双写）」章节 —— 接口约定、触发节奏、逐字段含义/单位/缺失表现、瘦身策略、日志排查表。
