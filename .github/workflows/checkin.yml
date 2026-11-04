@@ -77,6 +77,8 @@ jobs:
           YUNHU_TOKEN: ${{ secrets.YUNHU_TOKEN }}
           YUNHU_RECV_ID: ${{ secrets.YUNHU_RECV_ID }}
           YUNHU_RECV_TYPE: ${{ secrets.YUNHU_RECV_TYPE }}
+          # LifeLoom 上报（双写）：地址含 token，走 Secret；不配置则整段逻辑自动跳过
+          LIFELOOM_HOOK_URL: ${{ secrets.LIFELOOM_HOOK_URL }}
         run: python checkin.py
 
   keepalive:
